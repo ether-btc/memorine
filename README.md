@@ -1,5 +1,9 @@
 # Memorine
 
+[![PyPI](https://img.shields.io/pypi/v/memorine)](https://pypi.org/project/memorine/)
+[![Python](https://img.shields.io/pypi/pyversions/memorine)](https://pypi.org/project/memorine/)
+[![License](https://img.shields.io/pypi/l/memorine)](https://github.com/osvfelices/memorine/blob/main/LICENSE)
+
 Memory for AI agents that actually works like memory.
 
 Not a vector database. Not an embedding store. Not another RAG pipeline.
