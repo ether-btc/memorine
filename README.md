@@ -184,8 +184,8 @@ Any MCP-compatible client can connect. Add to your client config:
 {
     "mcpServers": {
         "memorine": {
-            "command": "memorine",
-            "args": []
+            "command": "python3",
+            "args": ["-m", "memorine.mcp_server"]
         }
     }
 }
