@@ -13,6 +13,7 @@ DEFAULT_DB_PATH = os.path.expanduser("~/.memorine/memorine.db")
 
 
 def get_connection(db_path=None):
+    """Get or create a thread-local SQLite connection."""
     path = db_path or DEFAULT_DB_PATH
     key = f"conn_{path}"
     if not hasattr(_LOCAL, key) or getattr(_LOCAL, key) is None:
@@ -26,6 +27,7 @@ def get_connection(db_path=None):
 
 
 def init_schema(conn):
+    """Create all tables, FTS indexes, triggers, and indexes."""
     c = conn.cursor()
 
     # -- CORTEX: facts + associations --
@@ -161,24 +163,28 @@ def init_schema(conn):
         ("events", "events_fts", "event, context, tags"),
         ("procedures", "procedures_fts", "name, description"),
     ]:
+        col_list = [col.strip() for col in cols.split(",")]
+        new_cols = ", ".join(f"new.{col}" for col in col_list)
+        old_cols = ", ".join(f"old.{col}" for col in col_list)
+
         c.execute(f"""
             CREATE TRIGGER IF NOT EXISTS {table}_ai AFTER INSERT ON {table} BEGIN
                 INSERT INTO {fts}(rowid, {cols})
-                VALUES (new.id, {', '.join(f'new.{c.strip()}' for c in cols.split(','))});
+                VALUES (new.id, {new_cols});
             END
         """)
         c.execute(f"""
             CREATE TRIGGER IF NOT EXISTS {table}_au AFTER UPDATE ON {table} BEGIN
                 INSERT INTO {fts}({fts}, rowid, {cols})
-                VALUES ('delete', old.id, {', '.join(f'old.{c.strip()}' for c in cols.split(','))});
+                VALUES ('delete', old.id, {old_cols});
                 INSERT INTO {fts}(rowid, {cols})
-                VALUES (new.id, {', '.join(f'new.{c.strip()}' for c in cols.split(','))});
+                VALUES (new.id, {new_cols});
             END
         """)
         c.execute(f"""
             CREATE TRIGGER IF NOT EXISTS {table}_ad AFTER DELETE ON {table} BEGIN
                 INSERT INTO {fts}({fts}, rowid, {cols})
-                VALUES ('delete', old.id, {', '.join(f'old.{c.strip()}' for c in cols.split(','))});
+                VALUES ('delete', old.id, {old_cols});
             END
         """)
 
@@ -204,7 +210,7 @@ def init_schema(conn):
         from . import embeddings
         if embeddings.is_available():
             embeddings.init_vec_schema(conn)
-    except Exception:
+    except ImportError:
         pass
 
 
@@ -230,20 +236,17 @@ def get_stats(conn, agent_id):
         "SELECT COUNT(*) FROM shared WHERE from_agent = ?", (agent_id,)
     ).fetchone()[0]
 
-    # Check if embeddings are active
     try:
-        count = conn.execute(
+        stats["embeddings"] = conn.execute(
             "SELECT COUNT(*) FROM fact_embeddings"
         ).fetchone()[0]
-        stats["embeddings"] = count
     except Exception:
         stats["embeddings"] = 0
 
-    # DB file size
     path = conn.execute("PRAGMA database_list").fetchone()[2]
     try:
         stats["db_size_bytes"] = os.path.getsize(path)
-    except Exception:
+    except OSError:
         stats["db_size_bytes"] = 0
 
     return stats

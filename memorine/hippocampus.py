@@ -8,8 +8,7 @@ import re
 import time
 
 
-def log_event(conn, agent_id, event, context=None, tags=None,
-              caused_by=None):
+def log_event(conn, agent_id, event, context=None, tags=None, caused_by=None):
     """Record an event with optional context and causal link."""
     now = time.time()
     ctx_json = json.dumps(context) if context else None
@@ -30,7 +29,6 @@ def recall_events(conn, agent_id, query=None, since=None, until=None,
     if query:
         fts_query = " OR ".join(re.findall(r"\w{3,}", query.lower()))
         if fts_query:
-            # Use subquery for FTS to avoid JOIN issues with additional filters
             sql = """
                 SELECT * FROM events
                 WHERE id IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?)
@@ -61,15 +59,15 @@ def recall_events(conn, agent_id, query=None, since=None, until=None,
     rows = conn.execute(sql, params).fetchall()
     results = []
     for row in rows:
-        r = dict(row)
-        if r.get("context"):
+        event_dict = dict(row)
+        if event_dict.get("context"):
             try:
-                r["context"] = json.loads(r["context"])
+                event_dict["context"] = json.loads(event_dict["context"])
             except (json.JSONDecodeError, TypeError):
                 pass
-        if r.get("tags") and isinstance(r["tags"], str):
-            r["tags"] = r["tags"].split(",")
-        results.append(r)
+        if event_dict.get("tags") and isinstance(event_dict["tags"], str):
+            event_dict["tags"] = event_dict["tags"].split(",")
+        results.append(event_dict)
     return results
 
 

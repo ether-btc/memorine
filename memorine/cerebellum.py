@@ -3,9 +3,14 @@ Memorine cerebellum — procedures that learn, optimize, and evolve.
 Track what works, what fails, and why. Auto-optimize over time.
 """
 
-import json
 import re
 import time
+
+from .constants import (
+    AUTO_OPTIMIZE_MIN_RUNS,
+    STEP_OPTIMIZE_MIN_RUNS,
+    STEP_SKIP_FAILURE_RATE,
+)
 
 
 def create_procedure(conn, agent_id, name, description=None, steps=None):
@@ -45,7 +50,6 @@ def start_run(conn, procedure_id):
 def log_step(conn, run_id, step_order, description, success=True,
              error=None, duration_ms=None, agent_id=None):
     """Log the result of a step in a procedure run."""
-    # Validate run belongs to agent if agent_id is provided
     if agent_id:
         check = conn.execute("""
             SELECT pr.id FROM procedure_runs pr
@@ -53,7 +57,7 @@ def log_step(conn, run_id, step_order, description, success=True,
             WHERE pr.id = ? AND p.agent_id = ?
         """, (run_id, agent_id)).fetchone()
         if not check:
-            return  # Run doesn't belong to this agent
+            return
 
     now = time.time()
     conn.execute(
@@ -63,13 +67,11 @@ def log_step(conn, run_id, step_order, description, success=True,
          duration_ms, now)
     )
 
-    # Get procedure_id from run
     row = conn.execute(
         "SELECT procedure_id FROM procedure_runs WHERE id = ?", (run_id,)
     ).fetchone()
     if row:
         proc_id = row["procedure_id"]
-        # Update or create step stats
         existing = conn.execute(
             "SELECT id FROM procedure_steps "
             "WHERE procedure_id = ? AND step_order = ?",
@@ -104,7 +106,6 @@ def log_step(conn, run_id, step_order, description, success=True,
 
 def complete_run(conn, run_id, success=True, error=None, agent_id=None):
     """Mark a procedure run as complete."""
-    # Validate run belongs to agent if agent_id is provided
     if agent_id:
         check = conn.execute("""
             SELECT pr.id FROM procedure_runs pr
@@ -130,7 +131,6 @@ def complete_run(conn, run_id, success=True, error=None, agent_id=None):
         (now, int(success), error, duration, run_id)
     )
 
-    # Update procedure stats
     proc_id = started["procedure_id"]
     if success:
         conn.execute(
@@ -153,7 +153,7 @@ def complete_run(conn, run_id, success=True, error=None, agent_id=None):
     proc = conn.execute(
         "SELECT total_runs FROM procedures WHERE id = ?", (proc_id,)
     ).fetchone()
-    if proc and proc["total_runs"] >= 5:
+    if proc and proc["total_runs"] >= AUTO_OPTIMIZE_MIN_RUNS:
         optimize(conn, proc_id)
 
 
@@ -166,9 +166,9 @@ def optimize(conn, procedure_id):
     ).fetchall()
 
     for step in steps:
-        if step["total_runs"] >= 3:
+        if step["total_runs"] >= STEP_OPTIMIZE_MIN_RUNS:
             fail_rate = step["failures"] / step["total_runs"]
-            if fail_rate > 0.7:
+            if fail_rate > STEP_SKIP_FAILURE_RATE:
                 conn.execute(
                     "UPDATE procedure_steps SET skip_recommended = 1 "
                     "WHERE id = ?",
@@ -197,10 +197,10 @@ def get_procedure(conn, agent_id, name):
     ).fetchall()
 
     result["steps"] = []
-    for s in steps:
-        step = dict(s)
-        if s["total_runs"] > 0:
-            step["success_rate"] = round(s["successes"] / s["total_runs"], 3)
+    for step_row in steps:
+        step = dict(step_row)
+        if step_row["total_runs"] > 0:
+            step["success_rate"] = round(step_row["successes"] / step_row["total_runs"], 3)
         else:
             step["success_rate"] = None
         result["steps"].append(step)
@@ -212,7 +212,6 @@ def get_procedure(conn, agent_id, name):
     else:
         result["success_rate"] = None
 
-    # Recent runs
     runs = conn.execute(
         "SELECT * FROM procedure_runs WHERE procedure_id = ? "
         "ORDER BY started_at DESC LIMIT 5",

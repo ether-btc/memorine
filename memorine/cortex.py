@@ -3,10 +3,25 @@ Memorine cortex — facts, associations, and contradiction detection.
 No LLM needed. Pure algorithmic memory.
 """
 
+import logging
 import re
 import time
+from typing import Any, Optional
 
 from . import amygdala
+from .constants import (
+    CONTRADICTION_SIMILARITY_MIN,
+    DUPLICATE_SIMILARITY_MIN,
+    RECALL_REINFORCE_BOOST,
+    SEMANTIC_BLEND_WEIGHT,
+    SEMANTIC_RELEVANCE_FLOOR,
+    SUPERSEDE_CONFIDENCE_MIN,
+    WEIGHT_DEFAULT,
+    WEIGHT_MAX,
+    WEIGHT_MIN,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _tokenize(text):
@@ -27,7 +42,7 @@ def _get_embeddings():
         from . import embeddings
         if embeddings.is_available():
             return embeddings
-    except Exception:
+    except ImportError:
         pass
     return None
 
@@ -46,8 +61,8 @@ def learn(conn, agent_id, fact, category="general", confidence=1.0,
     confidence = max(0.0, min(float(confidence), 1.0))
 
     now = time.time()
-    w = weight if weight is not None else 1.0
-    w = max(0.1, min(float(w), 10.0))
+    w = weight if weight is not None else WEIGHT_DEFAULT
+    w = max(WEIGHT_MIN, min(float(w), WEIGHT_MAX))
     tokens = _tokenize(fact)
 
     # Check for contradictions: same agent, same category, similar text
@@ -60,7 +75,7 @@ def learn(conn, agent_id, fact, category="general", confidence=1.0,
 
     for row in existing:
         sim = _jaccard(tokens, _tokenize(row["fact"]))
-        if sim >= 0.5 and sim < 0.95:
+        if CONTRADICTION_SIMILARITY_MIN <= sim < DUPLICATE_SIMILARITY_MIN:
             contradictions.append({
                 "id": row["id"],
                 "fact": row["fact"],
@@ -68,7 +83,7 @@ def learn(conn, agent_id, fact, category="general", confidence=1.0,
             })
             if confidence >= row["confidence"]:
                 amygdala.weaken(conn, row["id"])
-        elif sim >= 0.95:
+        elif sim >= DUPLICATE_SIMILARITY_MIN:
             amygdala.reinforce(conn, row["id"])
             return row["id"], []
 
@@ -81,21 +96,19 @@ def learn(conn, agent_id, fact, category="general", confidence=1.0,
     fact_id = cur.lastrowid
     conn.commit()
 
-    # Generate embedding if available
     emb = _get_embeddings()
     if emb:
         try:
             emb.embed_fact(conn, fact_id, fact)
         except Exception:
-            pass
+            logger.warning("Failed to embed fact %d", fact_id, exc_info=True)
 
-    # Create association if relates_to was given
     if relates_to:
         link_by_text(conn, agent_id, fact_id, relates_to)
 
     # Mark contradicted facts as superseded
     for c in contradictions:
-        if confidence >= 0.8:
+        if confidence >= SUPERSEDE_CONFIDENCE_MIN:
             conn.execute(
                 "UPDATE facts SET superseded_by = ? WHERE id = ?",
                 (fact_id, c["id"])
@@ -112,20 +125,15 @@ def learn_batch(conn, agent_id, facts_list):
     facts_list: list of dicts with keys: fact, category, confidence, source, weight
     Returns: list of (fact_id, contradictions) tuples.
     """
-    # Pre-load existing facts for contradiction checking
     all_existing = conn.execute(
         "SELECT id, fact, category, confidence, weight FROM facts "
         "WHERE agent_id = ? AND active = 1",
         (agent_id,)
     ).fetchall()
 
-    # Index by category for fast lookup
     by_category = {}
     for row in all_existing:
-        cat = row["category"]
-        if cat not in by_category:
-            by_category[cat] = []
-        by_category[cat].append(row)
+        by_category.setdefault(row["category"], []).append(row)
 
     now = time.time()
     results = []
@@ -136,7 +144,7 @@ def learn_batch(conn, agent_id, facts_list):
         category = item.get("category", "general")
         confidence = item.get("confidence", 1.0)
         source = item.get("source")
-        w = item.get("weight", 1.0)
+        w = item.get("weight", WEIGHT_DEFAULT)
         tokens = _tokenize(fact_text)
 
         contradictions = []
@@ -144,7 +152,7 @@ def learn_batch(conn, agent_id, facts_list):
 
         for row in by_category.get(category, []):
             sim = _jaccard(tokens, _tokenize(row["fact"]))
-            if sim >= 0.5 and sim < 0.95:
+            if CONTRADICTION_SIMILARITY_MIN <= sim < DUPLICATE_SIMILARITY_MIN:
                 contradictions.append({
                     "id": row["id"],
                     "fact": row["fact"],
@@ -152,7 +160,7 @@ def learn_batch(conn, agent_id, facts_list):
                 })
                 if confidence >= row["confidence"]:
                     amygdala.weaken(conn, row["id"])
-            elif sim >= 0.95:
+            elif sim >= DUPLICATE_SIMILARITY_MIN:
                 amygdala.reinforce(conn, row["id"])
                 results.append((row["id"], []))
                 is_duplicate = True
@@ -171,7 +179,7 @@ def learn_batch(conn, agent_id, facts_list):
         new_facts_for_embedding.append((fact_id, fact_text))
 
         for c in contradictions:
-            if confidence >= 0.8:
+            if confidence >= SUPERSEDE_CONFIDENCE_MIN:
                 conn.execute(
                     "UPDATE facts SET superseded_by = ? WHERE id = ?",
                     (fact_id, c["id"])
@@ -181,13 +189,12 @@ def learn_batch(conn, agent_id, facts_list):
 
     conn.commit()
 
-    # Batch-embed all new facts at once
     emb = _get_embeddings()
     if emb and new_facts_for_embedding:
         try:
             emb.embed_facts_batch(conn, new_facts_for_embedding)
         except Exception:
-            pass
+            logger.warning("Failed to batch-embed %d facts", len(new_facts_for_embedding), exc_info=True)
 
     return results
 
@@ -200,32 +207,28 @@ def recall(conn, agent_id, query, limit=5, offset=0,
     with FTS5 keyword results. Falls back to pure FTS5 if embeddings
     are not installed.
     """
-    # Short-circuit on empty or whitespace-only queries
     if not query or not query.strip():
         return []
 
     now = time.time()
-    seen_ids = set()
+    seen = set()
     candidates = []
 
-    # Try semantic search first
+    # Semantic search
     emb = _get_embeddings()
     if emb:
         try:
-            semantic_results = emb.semantic_search(
+            sem_results = emb.semantic_search(
                 conn, query, agent_id, limit=limit * 2,
                 include_shared=include_shared
             )
-            for row in semantic_results:
-                sem_score = row.get("semantic_score", 0.0)
-                # Filter out low-relevance noise
-                if sem_score < 0.55:
+            for row in sem_results:
+                score = row.get("semantic_score", 0.0)
+                if score < SEMANTIC_RELEVANCE_FLOOR:
                     continue
-                if row["id"] not in seen_ids:
-                    seen_ids.add(row["id"])
+                if row["id"] not in seen:
+                    seen.add(row["id"])
                     ew = amygdala.effective_weight(row, now)
-                    # Blend semantic score with effective weight
-                    score = 0.6 * sem_score + 0.4 * ew
                     candidates.append({
                         "id": row["id"],
                         "fact": row["fact"],
@@ -235,11 +238,10 @@ def recall(conn, agent_id, query, limit=5, offset=0,
                         "source": row["source"],
                         "agent_id": row["agent_id"],
                         "own": row["agent_id"] == agent_id,
-                        "_score": score,
-                        "_method": "semantic",
+                        "_score": SEMANTIC_BLEND_WEIGHT * score + (1 - SEMANTIC_BLEND_WEIGHT) * ew,
                     })
         except Exception:
-            pass
+            logger.warning("Semantic search failed, falling back to FTS5", exc_info=True)
 
     # FTS5 search (always runs as complement or fallback)
     fts_query = " OR ".join(re.findall(r"\w{3,}", query.lower()))
@@ -264,11 +266,9 @@ def recall(conn, agent_id, query, limit=5, offset=0,
         sql += " ORDER BY facts_fts.rank LIMIT ?"
         params.append(limit * 3)
 
-        rows = conn.execute(sql, params).fetchall()
-
-        for row in rows:
-            if row["id"] not in seen_ids:
-                seen_ids.add(row["id"])
+        for row in conn.execute(sql, params).fetchall():
+            if row["id"] not in seen:
+                seen.add(row["id"])
                 ew = amygdala.effective_weight(row, now)
                 if ew >= min_weight:
                     candidates.append({
@@ -281,26 +281,16 @@ def recall(conn, agent_id, query, limit=5, offset=0,
                         "agent_id": row["agent_id"],
                         "own": row["agent_id"] == agent_id,
                         "_score": ew,
-                        "_method": "fts5",
                     })
 
-    # Sort by blended score
     candidates.sort(key=lambda x: x["_score"], reverse=True)
+    results = candidates[offset:offset + limit]
 
-    # Apply offset and limit
-    candidates = candidates[offset:offset + limit]
-
-    # Clean internal fields
-    results = []
-    for c in candidates:
-        c.pop("_score", None)
-        c.pop("_method", None)
-        results.append(c)
-
-    # Reinforce accessed memories
+    # Strip internal scoring field, reinforce accessed own memories
     for r in results:
+        r.pop("_score", None)
         if r["own"]:
-            amygdala.reinforce(conn, r["id"], boost=0.05)
+            amygdala.reinforce(conn, r["id"], boost=RECALL_REINFORCE_BOOST)
 
     return results
 
@@ -313,11 +303,10 @@ def forget(conn, fact_id, agent_id=None):
         sql += " AND agent_id = ?"
         params.append(agent_id)
     conn.execute(sql, params)
-    # Remove embedding so semantic search never finds forgotten facts
     try:
         conn.execute("DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,))
     except Exception:
-        pass  # Table may not exist if embeddings not installed
+        pass  # table may not exist if embeddings not installed
     conn.commit()
 
 
@@ -337,25 +326,23 @@ def update_fact(conn, fact_id, new_value, agent_id=None, confidence=None):
     conn.execute(sql, params)
     conn.commit()
 
-    # Re-embed if available
     emb = _get_embeddings()
     if emb:
         try:
             emb.embed_fact(conn, fact_id, new_value)
         except Exception:
-            pass
+            logger.warning("Failed to re-embed fact %d", fact_id, exc_info=True)
 
 
 def link(conn, fact_a, fact_b, relation="related", strength=1.0, agent_id=None):
-    """Create an association between two facts. Validates ownership if agent_id given."""
+    """Create an association between two facts."""
     if agent_id:
-        # Verify at least one fact belongs to the agent
-        check = conn.execute(
+        count = conn.execute(
             "SELECT COUNT(*) FROM facts WHERE id IN (?, ?) AND agent_id = ? AND active = 1",
             (fact_a, fact_b, agent_id)
         ).fetchone()[0]
-        if check == 0:
-            return  # Neither fact belongs to this agent
+        if count == 0:
+            return
     now = time.time()
     conn.execute(
         "INSERT INTO fact_links (fact_a, fact_b, relation, strength, created_at) "
@@ -367,8 +354,7 @@ def link(conn, fact_a, fact_b, relation="related", strength=1.0, agent_id=None):
 
 def link_by_text(conn, agent_id, fact_id, search_text):
     """Link a fact to existing facts matching search_text."""
-    matches = recall(conn, agent_id, search_text, limit=3, include_shared=False)
-    for m in matches:
+    for m in recall(conn, agent_id, search_text, limit=3, include_shared=False):
         if m["id"] != fact_id:
             link(conn, fact_id, m["id"])
 

@@ -11,7 +11,6 @@ from . import cortex
 def share(conn, fact_id, from_agent, to_agent=None):
     """Share a fact with another agent (or all agents if to_agent is None)."""
     now = time.time()
-    # Don't share duplicates
     existing = conn.execute(
         "SELECT id FROM shared WHERE fact_id = ? AND from_agent = ? "
         "AND to_agent IS ?",

@@ -4,6 +4,10 @@ Only loaded when fastembed and sqlite-vec are installed.
 pip install memorine[embeddings]
 """
 
+import struct
+
+from .constants import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL, L2_DISTANCE_FALLBACK
+
 _AVAILABLE = False
 _EMBEDDER = None
 
@@ -22,7 +26,7 @@ def is_available():
 def _get_embedder():
     global _EMBEDDER
     if _EMBEDDER is None and _AVAILABLE:
-        _EMBEDDER = TextEmbedding("BAAI/bge-small-en-v1.5")
+        _EMBEDDER = TextEmbedding(EMBEDDING_MODEL)
     return _EMBEDDER
 
 
@@ -31,9 +35,9 @@ def init_vec_schema(conn):
     if not _AVAILABLE:
         return
     sqlite_vec.load(conn)
-    conn.execute("""
+    conn.execute(f"""
         CREATE VIRTUAL TABLE IF NOT EXISTS fact_embeddings
-        USING vec0(fact_id INTEGER PRIMARY KEY, embedding FLOAT[384])
+        USING vec0(fact_id INTEGER PRIMARY KEY, embedding FLOAT[{EMBEDDING_DIMENSIONS}])
     """)
     conn.commit()
 
@@ -47,7 +51,6 @@ def embed_fact(conn, fact_id, text):
     if not vectors:
         return
     vec = vectors[0].tolist()
-    # Upsert: delete existing then insert
     conn.execute("DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,))
     conn.execute(
         "INSERT INTO fact_embeddings (fact_id, embedding) VALUES (?, ?)",
@@ -57,10 +60,7 @@ def embed_fact(conn, fact_id, text):
 
 
 def embed_facts_batch(conn, facts_list):
-    """Batch-embed multiple facts at once. Much faster than one-by-one.
-
-    facts_list: list of (fact_id, text) tuples.
-    """
+    """Batch-embed multiple facts. facts_list: list of (fact_id, text) tuples."""
     embedder = _get_embedder()
     if not embedder or not facts_list:
         return
@@ -68,11 +68,11 @@ def embed_facts_batch(conn, facts_list):
     vectors = list(embedder.embed(list(texts)))
 
     for fact_id, vec in zip(ids, vectors):
-        vec_list = vec.tolist()
+        serialized = _serialize_vec(vec.tolist())
         conn.execute("DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,))
         conn.execute(
             "INSERT INTO fact_embeddings (fact_id, embedding) VALUES (?, ?)",
-            (fact_id, _serialize_vec(vec_list))
+            (fact_id, serialized)
         )
     conn.commit()
 
@@ -80,7 +80,7 @@ def embed_facts_batch(conn, facts_list):
 def semantic_search(conn, query_text, agent_id, limit=10, include_shared=True):
     """Find facts by meaning, not just keywords.
 
-    Returns list of fact dicts with a semantic_score field (0-1, higher = better).
+    Returns fact dicts with a semantic_score field (0-1, higher = better).
     """
     embedder = _get_embedder()
     if not embedder:
@@ -92,7 +92,6 @@ def semantic_search(conn, query_text, agent_id, limit=10, include_shared=True):
 
     vec = query_vec[0].tolist()
 
-    # KNN search against all embeddings (sqlite-vec requires k = ?)
     rows = conn.execute("""
         SELECT fact_id, distance
         FROM fact_embeddings
@@ -103,7 +102,6 @@ def semantic_search(conn, query_text, agent_id, limit=10, include_shared=True):
     if not rows:
         return []
 
-    # Fetch full fact rows and filter by agent
     fact_ids = [r["fact_id"] for r in rows]
     distances = {r["fact_id"]: r["distance"] for r in rows}
 
@@ -128,19 +126,18 @@ def semantic_search(conn, query_text, agent_id, limit=10, include_shared=True):
 
     results = []
     for row in fact_rows:
-        d = dict(row)
-        # Convert L2 distance to cosine similarity (0-1, higher = better)
-        # For normalized embeddings: cosine_sim = 1 - (L2_dist^2 / 2)
-        dist = distances.get(row["id"], 2.0)
-        d["semantic_score"] = max(0.0, 1.0 - (dist * dist / 2.0))
-        results.append(d)
+        fact_dict = dict(row)
+        # L2 distance → cosine similarity for normalized embeddings
+        dist = distances.get(row["id"], L2_DISTANCE_FALLBACK)
+        fact_dict["semantic_score"] = max(0.0, 1.0 - (dist * dist / 2.0))
+        results.append(fact_dict)
 
     results.sort(key=lambda x: x["semantic_score"], reverse=True)
     return results[:limit]
 
 
 def reindex_all(conn, agent_id):
-    """Rebuild embeddings for all active facts. Useful after first install."""
+    """Rebuild embeddings for all active facts."""
     all_facts = conn.execute(
         "SELECT id, fact FROM facts WHERE agent_id = ? AND active = 1",
         (agent_id,)
@@ -155,6 +152,5 @@ def reindex_all(conn, agent_id):
 
 
 def _serialize_vec(vec):
-    """Serialize a float list for sqlite-vec."""
-    import struct
+    """Pack float list for sqlite-vec."""
     return struct.pack(f"{len(vec)}f", *vec)

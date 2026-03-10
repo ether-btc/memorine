@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memorine"
-version = "0.2.0"
+version = "0.2.1"
 description = "Human-like memory for AI agents. No embeddings, no LLMs, no cost."
 readme = "README.md"
 license = {text = "MIT"}

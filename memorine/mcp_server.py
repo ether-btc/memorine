@@ -13,13 +13,19 @@ Add to openclaw.json:
 """
 
 import json
+import logging
 import sys
-import time
 
 from . import Mind
 
+logger = logging.getLogger(__name__)
+
+_MAX_STRING_LEN = 10000
+_MAX_AGENT_ID_LEN = 100
+
 
 def _read_message():
+    """Read a JSON-RPC message from stdin (Content-Length framing)."""
     header = ""
     while True:
         line = sys.stdin.readline()
@@ -29,9 +35,9 @@ def _read_message():
         if line == "\r\n" or line == "\n":
             break
     length = 0
-    for h in header.strip().split("\n"):
-        if h.lower().startswith("content-length:"):
-            length = int(h.split(":")[1].strip())
+    for header_line in header.strip().split("\n"):
+        if header_line.lower().startswith("content-length:"):
+            length = int(header_line.split(":")[1].strip())
     if length == 0:
         return None
     body = sys.stdin.read(length)
@@ -259,7 +265,7 @@ def _get_mind(agent_id):
     return _minds[agent_id]
 
 
-def _validate_string(val, field, max_len=10000):
+def _validate_string(val, field, max_len=_MAX_STRING_LEN):
     if not val or not isinstance(val, str) or not val.strip():
         raise ValueError(f"{field} must be a non-empty string")
     if len(val) > max_len:
@@ -267,25 +273,30 @@ def _validate_string(val, field, max_len=10000):
     return val.strip()
 
 
-def _validate_int(val, field, min_val=0, max_val=10000):
-    val = int(val)
-    if val < min_val or val > max_val:
-        raise ValueError(f"{field} must be between {min_val} and {max_val}")
-    return val
+def _parse_tags(raw):
+    """Parse comma-separated tags into a list, or None."""
+    if not raw:
+        return None
+    parsed = [t.strip() for t in raw.split(",") if t.strip()]
+    return parsed or None
 
 
 def handle_tool(name, args):
-    agent_id = _validate_string(args.get("agent_id", "default"), "agent_id", max_len=100)
+    """Route a tool call to the appropriate Mind method."""
+    agent_id = _validate_string(
+        args.get("agent_id", "default"), "agent_id",
+        max_len=_MAX_AGENT_ID_LEN
+    )
     mind = _get_mind(agent_id)
 
     if name == "memorine_learn":
-        fid, contras = mind.learn(
+        fact_id, contradictions = mind.learn(
             args["fact"],
             category=args.get("category", "general"),
             confidence=args.get("confidence", 1.0),
             relates_to=args.get("relates_to"),
         )
-        result = {"fact_id": fid, "contradictions": contras}
+        result = {"fact_id": fact_id, "contradictions": contradictions}
         return [{"type": "text", "text": json.dumps(result, default=str)}]
 
     elif name == "memorine_recall":
@@ -296,32 +307,26 @@ def handle_tool(name, args):
         return [{"type": "text", "text": json.dumps(facts, default=str)}]
 
     elif name == "memorine_log_event":
-        tags = None
-        if args.get("tags"):
-            tags = [t.strip() for t in args["tags"].split(",") if t.strip()]
-            tags = tags or None
-        eid = mind.log(
+        tags = _parse_tags(args.get("tags"))
+        event_id = mind.log(
             args["event"], tags=tags,
             caused_by=args.get("caused_by"),
         )
-        return [{"type": "text", "text": json.dumps({"event_id": eid})}]
+        return [{"type": "text", "text": json.dumps({"event_id": event_id})}]
 
     elif name == "memorine_events":
-        tags = None
-        if args.get("tags"):
-            tags = [t.strip() for t in args["tags"].split(",") if t.strip()]
-            tags = tags or None
-        evts = mind.events(
+        tags = _parse_tags(args.get("tags"))
+        event_list = mind.events(
             query=args.get("query"), tags=tags,
             limit=args.get("limit", 10),
         )
-        return [{"type": "text", "text": json.dumps(evts, default=str)}]
+        return [{"type": "text", "text": json.dumps(event_list, default=str)}]
 
     elif name == "memorine_share":
-        fid = mind.share(
+        fact_id = mind.share(
             args["fact"], to_agent=args.get("to_agent"),
         )
-        return [{"type": "text", "text": json.dumps({"fact_id": fid})}]
+        return [{"type": "text", "text": json.dumps({"fact_id": fact_id})}]
 
     elif name == "memorine_team_knowledge":
         facts = mind.team_knowledge(limit=args.get("limit", 20))
@@ -384,16 +389,17 @@ def handle_tool(name, args):
 
 
 def main():
+    """MCP server main loop."""
     while True:
         msg = _read_message()
         if msg is None:
             break
 
         method = msg.get("method", "")
-        id = msg.get("id")
+        request_id = msg.get("id")
 
         if method == "initialize":
-            _success(id, {
+            _success(request_id, {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {
@@ -406,7 +412,7 @@ def main():
             pass
 
         elif method == "tools/list":
-            _success(id, {"tools": TOOLS})
+            _success(request_id, {"tools": TOOLS})
 
         elif method == "tools/call":
             params = msg.get("params", {})
@@ -414,15 +420,16 @@ def main():
             tool_args = params.get("arguments", {})
             try:
                 content = handle_tool(tool_name, tool_args)
-                _success(id, {"content": content})
+                _success(request_id, {"content": content})
             except Exception as e:
-                _success(id, {
+                logger.error("Tool %s failed: %s", tool_name, e, exc_info=True)
+                _success(request_id, {
                     "content": [{"type": "text", "text": f"Error: {e}"}],
                     "isError": True,
                 })
 
-        elif id is not None:
-            _error(id, -32601, f"Method not found: {method}")
+        elif request_id is not None:
+            _error(request_id, -32601, f"Method not found: {method}")
 
 
 if __name__ == "__main__":

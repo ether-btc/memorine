@@ -9,12 +9,17 @@ Zero dependencies. Zero tokens. Zero cost. Just memory that works.
     brain.recall("hostkey")  # finds it + reinforces the memory
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
+import logging
 import time
+from typing import Any, Optional
 
+from .constants import PROFILE_WEIGHT_FLOOR
 from .db import get_connection, init_schema, get_stats
 from . import cortex, hippocampus, cerebellum, amygdala, synapses
+
+logger = logging.getLogger(__name__)
 
 
 class Mind:
@@ -26,15 +31,16 @@ class Mind:
         brain.recall("search query")
     """
 
-    def __init__(self, agent_id, db_path=None):
+    def __init__(self, agent_id: str, db_path: Optional[str] = None):
         self.agent_id = agent_id
         self.conn = get_connection(db_path)
         init_schema(self.conn)
 
-    # ── CORTEX: Facts ──────────────────────────────────────────
+    # -- CORTEX: Facts ----------------------------------------------------
 
-    def learn(self, fact, category="general", confidence=1.0,
-              source=None, weight=None, relates_to=None):
+    def learn(self, fact: str, category: str = "general", confidence: float = 1.0,
+              source: Optional[str] = None, weight: Optional[float] = None,
+              relates_to: Optional[str] = None) -> tuple[int, list[dict]]:
         """Store a fact. Returns (fact_id, contradictions).
 
         Automatically detects contradictions with existing knowledge.
@@ -46,7 +52,7 @@ class Mind:
             source=source, weight=weight, relates_to=relates_to
         )
 
-    def learn_batch(self, facts):
+    def learn_batch(self, facts: list[dict]) -> list[tuple[int, list[dict]]]:
         """Batch-learn multiple facts at once. Much faster for bulk imports.
 
         facts: list of dicts with keys: fact, category, confidence, source, weight
@@ -54,42 +60,45 @@ class Mind:
         """
         return cortex.learn_batch(self.conn, self.agent_id, facts)
 
-    def recall(self, query, limit=5, offset=0, include_shared=True):
+    def recall(self, query: str, limit: int = 5, offset: int = 0,
+               include_shared: bool = True) -> list[dict]:
         """Search memory for facts matching a query.
 
         Uses semantic search when embeddings are available, with FTS5
         as a complement and fallback. Results ranked by a blend of
-        semantic similarity and effective weight. Accessed memories get
-        reinforced, just like human recall strengthens memory.
+        semantic similarity and effective weight.
         """
         return cortex.recall(
             self.conn, self.agent_id, query,
             limit=limit, offset=offset, include_shared=include_shared
         )
 
-    def forget(self, fact_id):
+    def forget(self, fact_id: int) -> None:
         """Soft-delete a fact. Only works on facts owned by this agent."""
         cortex.forget(self.conn, fact_id, self.agent_id)
 
-    def correct(self, fact_id, new_value, confidence=None):
-        """Update a fact that turned out to be wrong. Only works on own facts."""
+    def correct(self, fact_id: int, new_value: str,
+                confidence: Optional[float] = None) -> None:
+        """Update a fact that turned out to be wrong."""
         cortex.update_fact(self.conn, fact_id, new_value, self.agent_id, confidence)
 
-    def connect(self, fact_a, fact_b, relation="related"):
-        """Create an association between two facts. At least one must be yours."""
+    def connect(self, fact_a: int, fact_b: int, relation: str = "related") -> None:
+        """Create an association between two facts."""
         cortex.link(self.conn, fact_a, fact_b, relation, agent_id=self.agent_id)
 
-    def associations(self, fact_id, depth=1):
+    def associations(self, fact_id: int, depth: int = 1) -> list[dict]:
         """Get facts associated with a given fact."""
         return cortex.associations(self.conn, fact_id, depth)
 
-    def facts(self, limit=None, offset=0):
+    def facts(self, limit: Optional[int] = None, offset: int = 0) -> list[dict]:
         """List all active facts."""
         return cortex.all_facts(self.conn, self.agent_id, limit=limit, offset=offset)
 
-    # ── HIPPOCAMPUS: Events ────────────────────────────────────
+    # -- HIPPOCAMPUS: Events ----------------------------------------------
 
-    def log(self, event, context=None, tags=None, caused_by=None):
+    def log(self, event: str, context: Any = None,
+            tags: Optional[list[str]] = None,
+            caused_by: Optional[int] = None) -> int:
         """Record something that happened.
 
         Use caused_by to build causal chains:
@@ -101,31 +110,35 @@ class Mind:
             context=context, tags=tags, caused_by=caused_by
         )
 
-    def events(self, query=None, since=None, until=None, tags=None,
-               limit=20, offset=0):
+    def events(self, query: Optional[str] = None,
+               since: Optional[float] = None, until: Optional[float] = None,
+               tags: Optional[list[str]] = None,
+               limit: int = 20, offset: int = 0) -> list[dict]:
         """Search past events by text, time range, or tags."""
         return hippocampus.recall_events(
             self.conn, self.agent_id, query=query,
             since=since, until=until, tags=tags, limit=limit, offset=offset
         )
 
-    def why(self, event_id):
+    def why(self, event_id: int) -> list[dict]:
         """Trace the causal chain: what caused this event?"""
         return hippocampus.causal_chain(self.conn, event_id, "up")
 
-    def consequences(self, event_id):
+    def consequences(self, event_id: int) -> list[dict]:
         """What did this event cause?"""
         return hippocampus.causal_chain(self.conn, event_id, "down")
 
-    def timeline(self, since=None, until=None, limit=50):
+    def timeline(self, since: Optional[float] = None,
+                 until: Optional[float] = None, limit: int = 50) -> list[dict]:
         """Get chronological event timeline."""
         return hippocampus.timeline(
             self.conn, self.agent_id, since=since, until=until, limit=limit
         )
 
-    # ── CEREBELLUM: Procedures ─────────────────────────────────
+    # -- CEREBELLUM: Procedures -------------------------------------------
 
-    def procedure(self, name, description=None, steps=None):
+    def procedure(self, name: str, description: Optional[str] = None,
+                  steps: Optional[list[str]] = None) -> "ProcedureRun":
         """Get or create a procedure. Returns a ProcedureRun context manager.
 
         Usage:
@@ -142,7 +155,7 @@ class Mind:
             proc_id = proc["id"]
         return ProcedureRun(self.conn, proc_id)
 
-    def anticipate(self, task_description):
+    def anticipate(self, task_description: str) -> dict:
         """Predict what you'll need for a task.
 
         Returns best procedure, recommended steps, warnings about
@@ -152,96 +165,99 @@ class Mind:
             self.conn, self.agent_id, task_description
         )
 
-    def procedures(self):
+    def procedures(self) -> list[dict]:
         """List all active procedures."""
         return cerebellum.list_procedures(self.conn, self.agent_id)
 
-    # ── AMYGDALA: Maintenance ──────────────────────────────────
+    # -- AMYGDALA: Maintenance --------------------------------------------
 
-    def cleanup(self, threshold=0.05):
+    def cleanup(self, threshold: float = 0.05) -> int:
         """Deactivate faded memories below threshold."""
         return amygdala.cleanup_faded(self.conn, self.agent_id, threshold)
 
-    def stats(self):
+    def stats(self) -> dict:
         """Database statistics: fact counts, events, procedures, db size."""
         return get_stats(self.conn, self.agent_id)
 
-    def reindex_embeddings(self):
-        """Rebuild all embeddings. Run this after installing memorine[embeddings]."""
+    def reindex_embeddings(self) -> int:
+        """Rebuild all embeddings. Run after installing memorine[embeddings]."""
         try:
             from . import embeddings
             if embeddings.is_available():
                 return embeddings.reindex_all(self.conn, self.agent_id)
-        except Exception:
+        except ImportError:
             pass
+        except Exception:
+            logger.warning("Failed to reindex embeddings", exc_info=True)
         return 0
 
-    # ── SYNAPSES: Sharing ──────────────────────────────────────
+    # -- SYNAPSES: Sharing ------------------------------------------------
 
-    def share(self, fact_text, to_agent=None, category="shared"):
+    def share(self, fact_text: str, to_agent: Optional[str] = None,
+              category: str = "shared") -> int:
         """Learn a fact and share it with another agent (or everyone)."""
         return synapses.share_fact(
             self.conn, self.agent_id, fact_text,
             to_agent=to_agent, category=category
         )
 
-    def shared_with_me(self, limit=20):
+    def shared_with_me(self, limit: int = 20) -> list[dict]:
         """Get facts other agents have shared with me."""
         return synapses.shared_with_me(self.conn, self.agent_id, limit)
 
-    def team_knowledge(self, category=None, limit=50):
+    def team_knowledge(self, category: Optional[str] = None,
+                       limit: int = 50) -> list[dict]:
         """Get collective team knowledge."""
         return synapses.team_knowledge(self.conn, category, limit)
 
-    # ── PROFILE ────────────────────────────────────────────────
+    # -- PROFILE ----------------------------------------------------------
 
-    def profile(self, max_facts=20, max_events=10):
+    def profile(self, max_facts: int = 20, max_events: int = 10) -> str:
         """Generate a cognitive profile — a summary of what this agent knows.
 
         Returns a plain text block ready to inject into a system prompt.
-        No LLM needed — built from structured data.
         """
         now = time.time()
         lines = [f"# Memory Profile: {self.agent_id}"]
 
         # Top facts by effective weight
-        all_f = cortex.all_facts(self.conn, self.agent_id)
+        all_facts = cortex.all_facts(self.conn, self.agent_id)
         weighted = []
-        for f in all_f:
-            ew = amygdala.effective_weight(f, now)
-            if ew > 0.1:
-                weighted.append((ew, f))
+        for fact in all_facts:
+            weight = amygdala.effective_weight(fact, now)
+            if weight > PROFILE_WEIGHT_FLOOR:
+                weighted.append((weight, fact))
         weighted.sort(key=lambda x: x[0], reverse=True)
 
         if weighted:
             lines.append("\n## Key Knowledge")
-            for ew, f in weighted[:max_facts]:
-                lines.append(f"- {f['fact']} [{f['category']}]")
+            for _weight, fact in weighted[:max_facts]:
+                lines.append(f"- {fact['fact']} [{fact['category']}]")
 
         # Shared knowledge
         shared = synapses.shared_with_me(self.conn, self.agent_id, limit=10)
         if shared:
             lines.append("\n## Team Knowledge")
-            for s in shared:
-                lines.append(f"- {s['fact']} (from {s['from_agent']})")
+            for shared_fact in shared:
+                lines.append(f"- {shared_fact['fact']} (from {shared_fact['from_agent']})")
 
         # Recent events
         recent = hippocampus.timeline(self.conn, self.agent_id, limit=max_events)
         if recent:
             lines.append("\n## Recent Activity")
-            for e in recent:
-                lines.append(f"- {e['event']}")
+            for event in recent:
+                lines.append(f"- {event['event']}")
 
-        # Active procedures + warnings
+        # Active procedures
         procs = cerebellum.list_procedures(self.conn, self.agent_id)
         if procs:
             lines.append("\n## Known Procedures")
-            for p in procs:
+            for proc in procs:
                 rate = ""
-                if p["total_runs"] > 0:
-                    sr = round(p["successes"] / p["total_runs"] * 100)
-                    rate = f" ({sr}% success, {p['total_runs']} runs)"
-                lines.append(f"- {p['name']}{rate}")
+                if proc["total_runs"] > 0:
+                    success_pct = round(proc["successes"] / proc["total_runs"] * 100)
+                    rate = f" ({success_pct}% success, {proc['total_runs']} runs)"
+                lines.append(f"- {proc['name']}{rate}")
 
         return "\n".join(lines)
 

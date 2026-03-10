@@ -3,11 +3,29 @@ Memorine amygdala — emotional weight, decay, and reinforcement.
 Memories that matter stick. The rest fades away.
 """
 
+import logging
 import math
 import time
+from typing import Any, Optional
+
+from .constants import (
+    CLEANUP_BATCH_SIZE,
+    CLEANUP_THRESHOLD,
+    ERROR_IMPORTANCE_MULTIPLIER,
+    MAX_STABILITY_ACCESS_COUNT,
+    MIN_RETENTION,
+    REINFORCE_BOOST,
+    REINFORCE_WEIGHT_CAP,
+    SECONDS_PER_DAY,
+    STABILITY_PER_ACCESS,
+    WEAKEN_PENALTY,
+    WEIGHT_MIN,
+)
+
+logger = logging.getLogger(__name__)
 
 
-def decay_factor(last_accessed, access_count, now=None):
+def decay_factor(last_accessed: float, access_count: int, now: Optional[float] = None) -> float:
     """Ebbinghaus forgetting curve with reinforcement.
 
     More access = more stable memory.
@@ -15,53 +33,56 @@ def decay_factor(last_accessed, access_count, now=None):
     Heavily used memories last months.
     """
     now = now or time.time()
-    days = max((now - last_accessed) / 86400, 0)
-    # stability grows with repeated access (caps at ~30 day half-life)
-    stability = 1 + min(access_count, 20) * 1.5
-    retention = math.exp(-days / stability)
-    return round(max(retention, 0.01), 4)
+    elapsed_days = max((now - last_accessed) / SECONDS_PER_DAY, 0)
+    stability = 1 + min(access_count, MAX_STABILITY_ACCESS_COUNT) * STABILITY_PER_ACCESS
+    retention = math.exp(-elapsed_days / stability)
+    return round(max(retention, MIN_RETENTION), 4)
 
 
-def effective_weight(fact_row, now=None):
+def effective_weight(fact_row: dict, now: Optional[float] = None) -> float:
     """Combine base weight, confidence, and decay into a single score."""
     decay = decay_factor(fact_row["last_accessed"], fact_row["access_count"], now)
     return round(fact_row["weight"] * fact_row["confidence"] * decay, 4)
 
 
-def importance_from_error(is_error):
+def importance_from_error(is_error: bool) -> float:
     """Errors get high emotional weight — pain sticks."""
-    return 2.5 if is_error else 1.0
+    return ERROR_IMPORTANCE_MULTIPLIER if is_error else 1.0
 
 
-def reinforce(conn, fact_id, boost=0.1):
+def reinforce(conn: Any, fact_id: int, boost: float = REINFORCE_BOOST) -> None:
     """Accessing a memory reinforces it — like rehearsal."""
     now = time.time()
     conn.execute("""
         UPDATE facts SET
             last_accessed = ?,
             access_count = access_count + 1,
-            weight = MIN(weight + ?, 5.0)
+            weight = MIN(weight + ?, ?)
         WHERE id = ?
-    """, (now, boost, fact_id))
+    """, (now, boost, REINFORCE_WEIGHT_CAP, fact_id))
     conn.commit()
 
 
-def weaken(conn, fact_id, penalty=0.2):
+def weaken(conn: Any, fact_id: int, penalty: float = WEAKEN_PENALTY) -> None:
     """Contradicted or wrong memories get weakened."""
     conn.execute("""
         UPDATE facts SET
-            weight = MAX(weight - ?, 0.1),
-            confidence = MAX(confidence - ?, 0.1)
+            weight = MAX(weight - ?, ?),
+            confidence = MAX(confidence - ?, ?)
         WHERE id = ?
-    """, (penalty, penalty, fact_id))
+    """, (penalty, WEIGHT_MIN, penalty, WEIGHT_MIN, fact_id))
     conn.commit()
 
 
-def cleanup_faded(conn, agent_id=None, threshold=0.05, batch_size=500):
+def cleanup_faded(
+    conn: Any,
+    agent_id: Optional[str] = None,
+    threshold: float = CLEANUP_THRESHOLD,
+    batch_size: int = CLEANUP_BATCH_SIZE,
+) -> int:
     """Deactivate memories that have faded below threshold.
 
-    Processes in batches to avoid loading the entire table into memory.
-    If agent_id is given, only cleans that agent's facts.
+    Processes in batches to avoid loading the entire table.
     """
     now = time.time()
     deactivated = 0
@@ -81,18 +102,18 @@ def cleanup_faded(conn, agent_id=None, threshold=0.05, batch_size=500):
         if not rows:
             break
 
-        batch_deactivated = 0
+        batch_count = 0
         for row in rows:
-            ew = effective_weight(row, now)
-            if ew < threshold:
+            if effective_weight(row, now) < threshold:
                 conn.execute(
                     "UPDATE facts SET active = 0 WHERE id = ?", (row["id"],)
                 )
-                batch_deactivated += 1
+                batch_count += 1
 
-        if batch_deactivated:
+        if batch_count:
             conn.commit()
-        deactivated += batch_deactivated
+            logger.debug("Deactivated %d faded memories in batch", batch_count)
+        deactivated += batch_count
 
         if len(rows) < batch_size:
             break
