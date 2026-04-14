@@ -7,8 +7,18 @@ import json
 import re
 import time
 
+# FTS5 special operator characters stripped from each token before quoting.
+FTS5_SPECIAL_CHARS = frozenset('*"(),')
 
-def log_event(conn, agent_id, event, context=None, tags=None, caused_by=None):
+
+def _sanitize_token(token: str) -> str:
+    """Strip FTS5 special chars from token, then wrap in double quotes."""
+    cleaned = "".join(c for c in token if c not in FTS5_SPECIAL_CHARS)
+    return f'"{cleaned}"'
+
+
+def log_event(conn, agent_id, event, context=None, tags=None,
+              caused_by=None):
     """Record an event with optional context and causal link."""
     now = time.time()
     ctx_json = json.dumps(context) if context else None
@@ -27,8 +37,10 @@ def recall_events(conn, agent_id, query=None, since=None, until=None,
                   tags=None, limit=20, offset=0):
     """Search events by text, time range, or tags."""
     if query:
-        fts_query = " OR ".join(re.findall(r"\w{3,}", query.lower()))
-        if fts_query:
+        tokens = re.findall(r"\w{3,}", query.lower())
+        if tokens:
+            fts_terms = [_sanitize_token(t) for t in tokens]
+            fts_query = " OR ".join(fts_terms)
             sql = """
                 SELECT * FROM events
                 WHERE id IN (SELECT rowid FROM events_fts WHERE events_fts MATCH ?)
@@ -36,8 +48,7 @@ def recall_events(conn, agent_id, query=None, since=None, until=None,
             """
             params = [fts_query, agent_id]
         else:
-            sql = "SELECT * FROM events WHERE agent_id = ?"
-            params = [agent_id]
+            return []
     else:
         sql = "SELECT * FROM events WHERE agent_id = ?"
         params = [agent_id]
@@ -59,15 +70,15 @@ def recall_events(conn, agent_id, query=None, since=None, until=None,
     rows = conn.execute(sql, params).fetchall()
     results = []
     for row in rows:
-        event_dict = dict(row)
-        if event_dict.get("context"):
+        r = dict(row)
+        if r.get("context"):
             try:
-                event_dict["context"] = json.loads(event_dict["context"])
+                r["context"] = json.loads(r["context"])
             except (json.JSONDecodeError, TypeError):
                 pass
-        if event_dict.get("tags") and isinstance(event_dict["tags"], str):
-            event_dict["tags"] = event_dict["tags"].split(",")
-        results.append(event_dict)
+        if r.get("tags") and isinstance(r["tags"], str):
+            r["tags"] = r["tags"].split(",")
+        results.append(r)
     return results
 
 
@@ -76,6 +87,11 @@ def causal_chain(conn, event_id, direction="up", max_depth=10):
 
     direction='up': find what caused this event (ancestors)
     direction='down': find what this event caused (descendants)
+
+    Circular reference protection:
+      - "up": breaks immediately when causal_parent is already in visited
+      - "down": breaks immediately when encountering already-visited node,
+                preventing re-enqueue of circular chain descendants
     """
     chain = []
     visited = set()
@@ -100,8 +116,8 @@ def causal_chain(conn, event_id, direction="up", max_depth=10):
             if not queue:
                 break
             current_id = queue.pop(0)
-            if current_id in visited:
-                continue
+            if current_id is None or current_id in visited:
+                break
             visited.add(current_id)
             children = conn.execute(
                 "SELECT * FROM events WHERE causal_parent = ?",
