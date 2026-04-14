@@ -13,19 +13,16 @@ Add to openclaw.json:
 """
 
 import json
-import logging
 import sys
+import time
 
 from . import Mind
-
-logger = logging.getLogger(__name__)
 
 _MAX_STRING_LEN = 10000
 _MAX_AGENT_ID_LEN = 100
 
 
 def _read_message():
-    """Read a JSON-RPC message from stdin (Content-Length framing)."""
     header = ""
     while True:
         line = sys.stdin.readline()
@@ -35,9 +32,9 @@ def _read_message():
         if line == "\r\n" or line == "\n":
             break
     length = 0
-    for header_line in header.strip().split("\n"):
-        if header_line.lower().startswith("content-length:"):
-            length = int(header_line.split(":")[1].strip())
+    for h in header.strip().split("\n"):
+        if h.lower().startswith("content-length:"):
+            length = int(h.split(":")[1].strip())
     if length == 0:
         return None
     body = sys.stdin.read(length)
@@ -265,7 +262,7 @@ def _get_mind(agent_id):
     return _minds[agent_id]
 
 
-def _validate_string(val, field, max_len=_MAX_STRING_LEN):
+def _validate_string(val, field, max_len=10000):
     if not val or not isinstance(val, str) or not val.strip():
         raise ValueError(f"{field} must be a non-empty string")
     if len(val) > max_len:
@@ -273,60 +270,67 @@ def _validate_string(val, field, max_len=_MAX_STRING_LEN):
     return val.strip()
 
 
-def _parse_tags(raw):
-    """Parse comma-separated tags into a list, or None."""
-    if not raw:
-        return None
-    parsed = [t.strip() for t in raw.split(",") if t.strip()]
-    return parsed or None
+def _validate_int(val, field, min_val=0, max_val=10000):
+    val = int(val)
+    if val < min_val or val > max_val:
+        raise ValueError(f"{field} must be between {min_val} and {max_val}")
+    return val
 
 
 def handle_tool(name, args):
-    """Route a tool call to the appropriate Mind method."""
-    agent_id = _validate_string(
-        args.get("agent_id", "default"), "agent_id",
-        max_len=_MAX_AGENT_ID_LEN
-    )
+    agent_id = _validate_string(args.get("agent_id", "default"), "agent_id", max_len=100)
     mind = _get_mind(agent_id)
 
     if name == "memorine_learn":
-        fact_id, contradictions = mind.learn(
-            args["fact"],
+        fact = _validate_string(args["fact"], "fact", max_len=_MAX_STRING_LEN)
+        fid, contras = mind.learn(
+            fact,
             category=args.get("category", "general"),
             confidence=args.get("confidence", 1.0),
             relates_to=args.get("relates_to"),
         )
-        result = {"fact_id": fact_id, "contradictions": contradictions}
+        result = {"fact_id": fid, "contradictions": contras}
         return [{"type": "text", "text": json.dumps(result, default=str)}]
 
+
     elif name == "memorine_recall":
+        query = _validate_string(args["query"], "query", max_len=_MAX_STRING_LEN)
         facts = mind.recall(
-            args["query"], limit=args.get("limit", 5),
+            query, limit=args.get("limit", 5),
             offset=args.get("offset", 0),
         )
         return [{"type": "text", "text": json.dumps(facts, default=str)}]
 
+
     elif name == "memorine_log_event":
-        tags = _parse_tags(args.get("tags"))
-        event_id = mind.log(
+        tags = None
+        if args.get("tags"):
+            tags = [t.strip() for t in args["tags"].split(",") if t.strip()]
+            tags = tags or None
+        eid = mind.log(
             args["event"], tags=tags,
             caused_by=args.get("caused_by"),
         )
-        return [{"type": "text", "text": json.dumps({"event_id": event_id})}]
+        return [{"type": "text", "text": json.dumps({"event_id": eid})}]
 
     elif name == "memorine_events":
-        tags = _parse_tags(args.get("tags"))
-        event_list = mind.events(
+        tags = None
+        if args.get("tags"):
+            tags = [t.strip() for t in args["tags"].split(",") if t.strip()]
+            tags = tags or None
+        evts = mind.events(
             query=args.get("query"), tags=tags,
             limit=args.get("limit", 10),
         )
-        return [{"type": "text", "text": json.dumps(event_list, default=str)}]
+        return [{"type": "text", "text": json.dumps(evts, default=str)}]
 
     elif name == "memorine_share":
-        fact_id = mind.share(
-            args["fact"], to_agent=args.get("to_agent"),
+        fact = _validate_string(args["fact"], "fact", max_len=_MAX_STRING_LEN)
+        fid = mind.share(
+            fact, to_agent=args.get("to_agent"),
         )
-        return [{"type": "text", "text": json.dumps({"fact_id": fact_id})}]
+        return [{"type": "text", "text": json.dumps({"fact_id": fid})}]
+
 
     elif name == "memorine_team_knowledge":
         facts = mind.team_knowledge(limit=args.get("limit", 20))
@@ -337,7 +341,8 @@ def handle_tool(name, args):
         return [{"type": "text", "text": profile}]
 
     elif name == "memorine_anticipate":
-        result = mind.anticipate(args["task"])
+        task = _validate_string(args["task"], "task", max_len=_MAX_STRING_LEN)
+        result = mind.anticipate(task)
         return [{"type": "text", "text": json.dumps(result, default=str)}]
 
     elif name == "memorine_procedure_start":
@@ -381,7 +386,14 @@ def handle_tool(name, args):
         return [{"type": "text", "text": json.dumps(stats, default=str)}]
 
     elif name == "memorine_learn_batch":
-        results = mind.learn_batch(args["facts"])
+        validated_facts = []
+        for i, f in enumerate(args["facts"]):
+            validated_facts.append({
+                "fact": _validate_string(f["fact"], f"facts[{i}].fact", max_len=_MAX_STRING_LEN),
+                "category": f.get("category", "general"),
+                "confidence": f.get("confidence", 1.0),
+            })
+        results = mind.learn_batch(validated_facts)
         output = [{"fact_id": fid, "contradictions": c} for fid, c in results]
         return [{"type": "text", "text": json.dumps(output, default=str)}]
 
@@ -389,17 +401,16 @@ def handle_tool(name, args):
 
 
 def main():
-    """MCP server main loop."""
     while True:
         msg = _read_message()
         if msg is None:
             break
 
         method = msg.get("method", "")
-        request_id = msg.get("id")
+        id = msg.get("id")
 
         if method == "initialize":
-            _success(request_id, {
+            _success(id, {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {
@@ -412,7 +423,7 @@ def main():
             pass
 
         elif method == "tools/list":
-            _success(request_id, {"tools": TOOLS})
+            _success(id, {"tools": TOOLS})
 
         elif method == "tools/call":
             params = msg.get("params", {})
@@ -420,16 +431,14 @@ def main():
             tool_args = params.get("arguments", {})
             try:
                 content = handle_tool(tool_name, tool_args)
-                _success(request_id, {"content": content})
+                _success(id, {"content": content})
+            except ValueError as e:
+                _error(id, -32000, str(e))
             except Exception as e:
-                logger.error("Tool %s failed: %s", tool_name, e, exc_info=True)
-                _success(request_id, {
-                    "content": [{"type": "text", "text": f"Error: {e}"}],
-                    "isError": True,
-                })
+                _error(id, -32000, f"Internal error: {e}")
 
-        elif request_id is not None:
-            _error(request_id, -32601, f"Method not found: {method}")
+        elif id is not None:
+            _error(id, -32601, f"Method not found: {method}")
 
 
 if __name__ == "__main__":
